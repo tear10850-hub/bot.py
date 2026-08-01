@@ -1,0 +1,524 @@
+import logging
+import os
+import random
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
+from pymongo import MongoClient
+
+# Logging သတ်မှတ်ခြင်း
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Render Environment Variables ထံမှ Data များကို ယူခြင်း
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+HF_API_KEY = os.getenv("HF_API_KEY")
+
+if not TELEGRAM_TOKEN:
+    logger.error("TELEGRAM_TOKEN ကို Environment Variable ထဲတွင် မတွေ့ရပါ။")
+if not MONGO_URI:
+    logger.error("MONGO_URI ကို Environment Variable ထဲတွင် မတွေ့ရပါ။")
+
+BLOCKED_EMOJIS = ["🍆", "🍑", "💦", "🔞"]
+OWNER_ID = 7771663458  # ⚠️ သင့်ရဲ့ Telegram ID
+CHANNEL_URL = "https://t.me/BOTUAPTE"
+
+# ရရှိနိုင်သော AI Model စာရင်းများ
+AVAILABLE_MODELS = {
+    "llama": {
+        "name": "Meta Llama 3 8B",
+        "url": "https://router.huggingface.co/hf-inference/models/meta-llama/Meta-Llama-3-8B-Instruct"
+    },
+    "mistral": {
+        "name": "Mistral 7B Instruct",
+        "url": "https://router.huggingface.co/hf-inference/models/mistralai/Mistral-7B-Instruct-v0.2"
+    },
+    "qwen": {
+        "name": "Qwen 2.5 7B Instruct",
+        "url": "https://router.huggingface.co/hf-inference/models/Qwen/Qwen2.5-7B-Instruct"
+    }
+}
+
+# 🍃 MongoDB Database သို့ ချိတ်ဆက်ခြင်း
+try:
+    client = MongoClient(MONGO_URI)
+    db = client["telegram_bot_db"]
+    collection = db["group_messages"]
+    settings_collection = db["bot_settings"]
+    chats_collection = db["all_chats"]
+    client.admin.command('ping')
+    logger.info("MongoDB သို့ အောင်မြင်စွာ ချိတ်ဆက်ပြီးပါပြီ။")
+except Exception as e:
+    logger.error(f"MongoDB ချိတ်ဆက်ရာတွင် အမှားဖြစ်ပွားသည်: {e}")
+
+# လက်ရှိ သုံးနေသော AI Model ကို ရယူရန်
+def get_current_model_key():
+    try:
+        setting = settings_collection.find_one({"setting_name": "active_ai_model"})
+        if setting and "model_key" in setting:
+            return setting["model_key"]
+    except Exception:
+        pass
+    return "llama"
+
+# 🚀 1. /start ဝင်လာပါက အချက်အလက်များနှင့် ဗီဒီယို၊ Channel ခလုတ်ပြမည်
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat = update.effective_chat
+        user = update.effective_user
+        chats_collection.update_one(
+            {"chat_id": chat.id},
+            {"$set": {"type": chat.type}},
+            upsert=True
+        )
+
+        name = user.full_name
+        user_id = user.id
+        username = f"@{user.username}" if user.username else "မရှိပါ"
+        
+        try:
+            user_profile = await context.bot.get_chat(user.id)
+            bio = user_profile.bio if user_profile.bio else "မရှိပါ"
+        except Exception:
+            bio = "မရှိပါ"
+
+        caption_text = (
+            f"👤 **အမည်:** {name}\n"
+            f"🆔 **ID:** `{user_id}`\n"
+            f"🔗 **Username:** {username}\n"
+            f"📝 **Bio:** {bio}"
+        )
+
+        keyboard = [[InlineKeyboardButton("📢 Channel သို့ဝင်ရန်", url=CHANNEL_URL)]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        saved_video = settings_collection.find_one({"setting_name": "start_video"})
+        if saved_video and "file_id" in saved_video:
+            await update.message.reply_video(
+                saved_video["file_id"],
+                caption=caption_text,
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                caption_text,
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"Start Command Error: {e}")
+
+# 🚨 2. Group ထဲတွင် Admin များကို အရေးပေါ်ခေါ်ဆိုခြင်း (/admin)
+async def call_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat = update.effective_chat
+        if chat.type == "private":
+            await update.message.reply_text("⚠️ ဤအမိန့်ကို Group များတွင်သာ အသုံးပြုနိုင်ပါသည်။")
+            return
+
+        admins = await chat.get_administrators()
+        admin_mentions = []
+
+        for admin in admins:
+            if admin.user.is_bot:
+                continue
+            
+            admin_user = admin.user
+            name = admin_user.full_name
+            if admin_user.username:
+                admin_mentions.append(f"@{admin_user.username}")
+            else:
+                admin_mentions.append(f"[{name}](tg://user?id={admin_user.id})")
+
+        if admin_mentions:
+            mentions_text = " ".join(admin_mentions)
+            alert_text = (
+                f"🚨 **အရေးပေါ် အသိပေးချက်!** 🚨\n\n"
+                f"Group Admin များ အမြန်ဆုံး လာရောက်ကြည့်ရှုပေးကြပါရန် 📣\n\n"
+                f"{mentions_text}"
+            )
+            await update.message.reply_text(alert_text, parse_mode="Markdown")
+        else:
+            await update.message.reply_text("⚠️ ဤ Group တွင် Admin မတွေ့ရှိပါ။")
+    except Exception as e:
+        logger.error(f"Call Admins Error: {e}")
+
+# 🎬 3. Video အသစ် သတ်မှတ်ခြင်း (/startvideo)
+async def set_start_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if user.id != OWNER_ID:
+        await update.message.reply_text("⚠️ ဤအမိန့်ကို Owner သာ အသုံးပြုနိုင်ပါသည်။")
+        return
+
+    reply_msg = update.message.reply_to_message
+    if reply_msg and reply_msg.video:
+        video_file_id = reply_msg.video.file_id
+        settings_collection.update_one(
+            {"setting_name": "start_video"},
+            {"$set": {"file_id": video_file_id}},
+            upsert=True
+        )
+        await update.message.reply_text("✅ /start လုပ်လျှင် ပြမည့် Video အသစ်ကို အောင်မြင်စွာ သတ်မှတ်ပြီးပါပြီ!")
+    else:
+        await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ ဗီဒီယိုတစ်ခုကို Reply ထောက်ပြီးမှ `/startvideo` ဟု ပေးပို့ပါ။")
+
+# 🎬 4. Owner မှ ထွက်သွားသူအတွက် နှုတ်ဆက်ဗီဒီယို သတ်မှတ်ခြင်း (/Tvideo)
+async def set_leave_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if user.id != OWNER_ID:
+        await update.message.reply_text("⚠️ ဤအမိန့်ကို Owner သာ အသုံးပြုနိုင်ပါသည်။")
+        return
+
+    reply_msg = update.message.reply_to_message
+    if reply_msg and reply_msg.video:
+        video_file_id = reply_msg.video.file_id
+        settings_collection.update_one(
+            {"setting_name": "leave_video"},
+            {"$set": {"file_id": video_file_id}},
+            upsert=True
+        )
+        await update.message.reply_text("✅ နှုတ်ဆက်ဗီဒီယိုအသစ်ကို အောင်မြင်စွာ သတ်မှတ်ပြီးပါပြီ!")
+    else:
+        await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ ဗီဒီယိုတစ်ခုကို Reply ထောက်ပြီးမှ `/Tvideo` ဟု ပေးပို့ပါ။")
+
+# ⚙️ 5. Group Admin များမှ ကြိုဆိုရေးဗီဒီယို သတ်မှတ်ခြင်း (/setwelcome)
+async def set_group_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type == "private":
+        await update.message.reply_text("⚠️ ဤအမိန့်ကို Group ထဲတွင်သာ အသုံးပြုရပါမည်။")
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ["administrator", "creator"] and user.id != OWNER_ID:
+        await update.message.reply_text("⚠️ ဤအမိန့်ကို Group Admin များသာ အသုံးပြုနိုင်ပါသည်။")
+        return
+
+    reply_msg = update.message.reply_to_message
+    if reply_msg and reply_msg.video:
+        video_file_id = reply_msg.video.file_id
+        settings_collection.update_one(
+            {"chat_id": chat.id, "setting_name": "group_welcome_video"},
+            {"$set": {"file_id": video_file_id}},
+            upsert=True
+        )
+        await update.message.reply_text("✅ ဤ Group အတွက် ကြိုဆိုရေးဗီဒီယို အောင်မြင်စွာ သတ်မှတ်ပြီးပါပြီ!")
+    else:
+        await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ ဗီဒီယိုတစ်ခုကို Reply ထောက်ပြီးမှ `/setwelcome` ဟု ပေးပို့ပါ။")
+
+# ⚙️ 6. AI Model ပြောင်းရန် ခလုတ်များပြသခြင်း (/aisetting)
+async def ai_setting_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if user.id != OWNER_ID:
+        await update.message.reply_text("⚠️ ဤဆက်တင်ကို Owner သာ ပြောင်းလဲနိုင်ပါသည်။")
+        return
+
+    current_key = get_current_model_key()
+    current_name = AVAILABLE_MODELS.get(current_key, {}).get("name", "Unknown")
+
+    keyboard = [
+        [InlineKeyboardButton(f"{'✅ ' if current_key == 'llama' else ''}Llama 3 8B", callback_data="model_llama")],
+        [InlineKeyboardButton(f"{'✅ ' if current_key == 'mistral' else ''}Mistral 7B", callback_data="model_mistral")],
+        [InlineKeyboardButton(f"{'✅ ' if current_key == 'qwen' else ''}Qwen 2.5 7B", callback_data="model_qwen")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"🤖 **AI Model ဆက်တင်များ**\n\n"
+        f"လက်ရှိအသုံးပြုနေသော မော်ဒယ်: **{current_name}**\n\n"
+        f"အောက်ပါတို့မှ ပြောင်းလဲလိုသော AI Model ကို ရွေးချယ်ပါ -",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
+# 🖱️ 7. Model ခလုတ် နှိပ်သည့်အခါ
+async def ai_setting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != OWNER_ID:
+        await query.answer("⚠️ Owner သာ ပြောင်းလဲခွင့်ရှိပါသည်။", show_alert=True)
+        return
+
+    data = query.data
+    if data.startswith("model_"):
+        selected_key = data.replace("model_", "")
+        if selected_key in AVAILABLE_MODELS:
+            settings_collection.update_one(
+                {"setting_name": "active_ai_model"},
+                {"$set": {"model_key": selected_key}},
+                upsert=True
+            )
+            new_name = AVAILABLE_MODELS[selected_key]["name"]
+            keyboard = [
+                [InlineKeyboardButton(f"{'✅ ' if selected_key == 'llama' else ''}Llama 3 8B", callback_data="model_llama")],
+                [InlineKeyboardButton(f"{'✅ ' if selected_key == 'mistral' else ''}Mistral 7B", callback_data="model_mistral")],
+                [InlineKeyboardButton(f"{'✅ ' if selected_key == 'qwen' else ''}Qwen 2.5 7B", callback_data="model_qwen")]
+            ]
+            await query.edit_message_text(
+                f"✅ **AI Model အောင်မြင်စွာ ပြောင်းလဲပြီးပါပြီ!**\n\n"
+                f"လက်ရှိသုံးမည့် မော်ဒယ်: **{new_name}**",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+
+# 🤖 8. AI COMMAND HANDLER (/ai)
+async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    user_message = " ".join(context.args)
+    if not user_message:
+        await update.message.reply_text("ကျေးဇူးပြု၍ မေးလိုသည့် မေးခွန်းကို ရေးပေးပါ။ ဥပမာ - `/ai မင်္ဂလာပါ`")
+        return
+
+    if not HF_API_KEY:
+        await update.message.reply_text("⚠️ HF_API_KEY ကို Render တွင် မထည့်ရသေးပါ။")
+        return
+
+    current_key = get_current_model_key()
+    hf_api_url = AVAILABLE_MODELS.get(current_key, AVAILABLE_MODELS["llama"])["url"]
+
+    await update.message.reply_text("🤖 စဉ်းစားနေပါတယ်...")
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    payload = {
+        "inputs": f"Answer this in Burmese naturally: {user_message}",
+        "parameters": {"max_new_tokens": 300, "return_full_text": False}
+    }
+
+    try:
+        response = requests.post(hf_api_url, headers=headers, json=payload, timeout=25)
+        if response.status_code != 200:
+            await update.message.reply_text(f"⚠️ AI ဆာဗာ အလုပ်မလုပ်ပါ။ (Status: {response.status_code})")
+            return
+
+        res_json = response.json()
+        ai_reply = "ပြန်လည်ဖြေကြားရန် အချက်အလက် မရရှိပါ။"
+        if isinstance(res_json, list) and len(res_json) > 0:
+            ai_reply = res_json[0].get("generated_text", ai_reply)
+        elif isinstance(res_json, dict):
+            if "generated_text" in res_json:
+                ai_reply = res_json["generated_text"]
+            elif "error" in res_json:
+                ai_reply = f"API Error: {res_json['error']}"
+
+        await update.message.reply_text(ai_reply, reply_to_message_id=update.message.message_id)
+    except Exception as e:
+        logger.error(f"AI Error: {e}")
+        await update.message.reply_text("ချိတ်ဆက်ရာတွင် အမှားအယွင်းရှိသွားပါသည်။")
+
+# 📢 9. BROADCAST SYSTEM (/bcast)
+async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if user.id != OWNER_ID:
+        await update.message.reply_text("⚠️ ဤအမိန့်ကို Owner သာ အသုံးပြုနိုင်ပါသည်။")
+        return
+
+    reply_msg = update.message.reply_to_message
+    if not reply_msg:
+        await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ ပို့လိုသော ကြော်ငြာမက်ဆေ့ဂျ်ကို Reply ပြီးမှ `/bcast` ဟု ပေးပို့ပါ။")
+        return
+
+    all_chats = list(chats_collection.find({}))
+    group_chats = [c for c in all_chats if c.get("type") in ["group", "supergroup"]]
+    private_chats = [c for c in all_chats if c.get("type") == "private"]
+
+    total_groups = len(group_chats)
+    total_pm = len(private_chats)
+
+    await update.message.reply_text(
+        f"စတင်ပိုဆောင်နေပါပီရှင့်🌷🌷 နတ်သားလေး\n"
+        f"Group({total_groups})ခု member chat({total_pm})ခု💐🌾သို့.........\n"
+        f"ပို့တဲဟာပြန်ပို့\n"
+        f"ရောက်ရှိသွားပါပီရှင့်🌹🌹"
+    )
+
+    group_success, group_failed, pm_success, pm_failed = 0, 0, 0, 0
+
+    for chat in group_chats:
+        try:
+            await context.bot.copy_message(chat_id=chat["chat_id"], from_chat_id=reply_msg.chat_id, message_id=reply_msg.message_id)
+            group_success += 1
+        except Exception:
+            group_failed += 1
+
+    for chat in private_chats:
+        try:
+            await context.bot.copy_message(chat_id=chat["chat_id"], from_chat_id=reply_msg.chat_id, message_id=reply_msg.message_id)
+            pm_success += 1
+        except Exception:
+            pm_failed += 1
+
+    result_text = (
+        f"Group({total_groups})မှာ Group({group_success})ရောက်။ Group({group_failed})မရောက်ပါ🥺🥀🥀\n"
+        f"Mamber caht({total_pm})မှာ caht({pm_success})ရောက်။ chat({pm_failed})မရောက်ပါရှင့်😓😓\n\n"
+        f"ကျေးဇူးတင်ပါတယ် by mya🍃🍂"
+    )
+    await update.message.reply_text(result_text)
+
+# 👋 10. Group ထဲသို့ လူအသစ်ဝင်လာခြင်း နှင့် ထွက်သွားခြင်းကို ကိုင်တွယ်ရန်
+async def handle_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        message = update.message
+        if not message:
+            return
+
+        chat = message.effective_chat
+
+        if message.new_chat_members:
+            for new_user in message.new_chat_members:
+                if new_user.id == context.bot.id:
+                    continue
+
+                name = new_user.full_name
+                user_id = new_user.id
+                username = f"@{new_user.username}" if new_user.username else name
+
+                welcome_setting = settings_collection.find_one({"chat_id": chat.id, "setting_name": "group_welcome_video"})
+                
+                caption_text = (
+                    f"👋 မင်္ဂလာပါ {name} ({username}) ရှင့်!\n"
+                    f"🆔 ID: `{user_id}`\n"
+                    f"ဤ Group လေးသို့ ဖိတ်ခေါ်ပါတယ်ခင်ဗျာ။"
+                )
+
+                if welcome_setting and "file_id" in welcome_setting:
+                    await message.reply_video(
+                        welcome_setting["file_id"],
+                        caption=caption_text,
+                        parse_mode="Markdown"
+                    )
+                else:
+                    try:
+                        photos = await context.bot.get_user_profile_photos(new_user.id, limit=1)
+                        if photos.total_count > 0:
+                            photo_file_id = photos.photos[0][0].file_id
+                            await message.reply_photo(
+                                photo_file_id,
+                                caption=caption_text,
+                                parse_mode="Markdown"
+                            )
+                        else:
+                            await message.reply_text(caption_text, parse_mode="Markdown")
+                    except Exception:
+                        await message.reply_text(caption_text, parse_mode="Markdown")
+
+        if message.left_chat_member:
+            left_user = message.left_chat_member
+            if left_user.id == context.bot.id:
+                return
+
+            name = left_user.full_name
+            user_id = left_user.id
+            username = f"@{left_user.username}" if left_user.username else name
+
+            leave_text = (
+                f":အချစ်ခံချင်ရုံပါ🥀🥀\n"
+                f"အပစ်ခံရမယ်လို🥺\n"
+                f"ဘယ်သူကထင်မှာလဲ😔\n"
+                f"ချိုသာစွာလဲညာခဲ့ဖူးတယ်\n"
+                f"ပြန်လာဖို့လဲမှာခဲ့ဖူးတယ်\n"
+                f"ဒီလောက်ဆိုတော်ပီလေ\n"
+                f"မုသားတွေလဲမချိုတော့ဘူး\n"
+                f"လူကြားထဲလဲမငိုချင်တော့ဘူး😔💔\n"
+                f"နာကျင်ပါများလာရင်ကျင့်သားရသွားပါလိမ့်မယ်🥀\n"
+                f"တစ်ချို့နာကျင်မှုတွေကမျက်ရည်ကျပြရတာထက်မျက်ရည်မကျအောင်ထိန်းပြီးပြုံးပြရတာမျိုး💔🥀🥀🥀🥀\n"
+                f"(🤕)ရေ..... [{username}](tg://user?id={user_id})"
+            )
+
+            leave_video_setting = settings_collection.find_one({"setting_name": "leave_video"})
+
+            if leave_video_setting and "file_id" in leave_video_setting:
+                await message.reply_video(
+                    leave_video_setting["file_id"],
+                    caption=leave_text,
+                    parse_mode="Markdown"
+                )
+            else:
+                await message.reply_text(
+                    leave_text,
+                    parse_mode="Markdown"
+                )
+
+    except Exception as e:
+        logger.error(f"Chat Member Error: {e}")
+
+# 💬 Group/Chat ထဲက မက်ဆေ့ဂျ်များကို ကိုင်တွယ်မည့် Function
+async def handle_group_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        message = update.message
+        if not message:
+            return
+
+        chat = message.chat
+        user = message.from_user
+
+        chats_collection.update_one(
+            {"chat_id": chat.id},
+            {"$set": {"type": chat.type}},
+            upsert=True
+        )
+
+        if message.sticker:
+            emoji = message.sticker.emoji if message.sticker.emoji else ""
+            if any(e in emoji for e in BLOCKED_EMOJIS):
+                return
+            if user and user.id == OWNER_ID:
+                collection.insert_one({"type": "sticker", "content": message.sticker.file_id})
+            return
+
+        if message.photo:
+            return
+
+        if message.text:
+            user_text = message.text.strip()
+            collection.insert_one({"type": "text", "content": user_text})
+
+            all_messages = list(collection.find({}, {"_id": 0}))
+            if all_messages:
+                chosen = random.choice(all_messages)
+                await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+                
+                if chosen.get("type") == "sticker":
+                    await message.reply_sticker(chosen["content"], reply_to_message_id=message.message_id)
+                else:
+                    await message.reply_text(chosen["content"], reply_to_message_id=message.message_id)
+                    
+    except Exception as e:
+        logger.error(f"Message ကိုင်တွယ်ရာတွင် Error ဖြစ်သည်: {e}")
+
+def main():
+    if not TELEGRAM_TOKEN or not MONGO_URI:
+        print("❌ Bot ကို စတင်၍ မရပါ။ Environment Variables များကို စစ်ဆေးပါ။")
+        return
+
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("admin", call_admins_command))
+    app.add_handler(CommandHandler("startvideo", set_start_video))
+    app.add_handler(CommandHandler("Tvideo", set_leave_video))
+    app.add_handler(CommandHandler("setwelcome", set_group_welcome))
+    app.add_handler(CommandHandler("aisetting", ai_setting_command))
+    app.add_handler(CommandHandler("bcast", broadcast_message))
+    app.add_handler(CommandHandler("ai", ask_ai))
+    
+    app.add_handler(CallbackQueryHandler(ai_setting_callback, pattern="^model_"))
+    
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER, handle_chat_members))
+    
+    chat_filter = filters.TEXT | filters.Sticker.ALL | filters.PHOTO
+    app.add_handler(MessageHandler(chat_filter, handle_group_messages))
+
+    logger.info("🤖 Bot သည် Render ပေါ်တွင် တည်ငြိမ်စွာ စတင်အလုပ်လုပ်နေပါပြီ...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
+
