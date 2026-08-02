@@ -1,5 +1,6 @@
-fastapi
-uvicorn
 python-telegram-bot
 pymongo
 requests
+urllib3
+certifi
+
