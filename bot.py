@@ -1197,7 +1197,10 @@ async def main():
         
         # Create application
         updater = Updater(token=Config.TELEGRAM_BOT_TOKEN, use_context=True)
-dp = updater.dispatcher
+try:
+    dp = updater.dispatcher
+except Exception as e:
+    logger.error(f"Error: {e}")
 db.bot = updater.bot
         
         # ===== Commands =====
