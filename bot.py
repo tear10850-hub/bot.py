@@ -5,8 +5,8 @@ import random
 from datetime import datetime, timedelta
 from collections import defaultdict
 
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 from config import Config
 from database import Database
@@ -1196,56 +1196,57 @@ async def main():
         await db.connect()
         
         # Create application
-        app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
-        db.bot = app.bot
+        updater = Updater(token=Config.TELEGRAM_BOT_TOKEN, use_context=True)
+dp = updater.dispatcher
+db.bot = updater.bot
         
         # ===== Commands =====
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("teach", teach_command))
-        app.add_handler(CommandHandler("report", report_command))
+        dp.add_handler(CommandHandler("start", start))
+        dp.add_handler(CommandHandler("help", help_command))
+        dp.add_handler(CommandHandler("teach", teach_command))
+        dp.add_handler(CommandHandler("report", report_command))
         
-        app.add_handler(CommandHandler("ban", ban_command))
-        app.add_handler(CommandHandler("unban", unban_command))
-        app.add_handler(CommandHandler("mute", mute_command))
-        app.add_handler(CommandHandler("unmute", unmute_command))
+        dp.add_handler(CommandHandler("ban", ban_command))
+        dp.add_handler(CommandHandler("unban", unban_command))
+        dp.add_handler(CommandHandler("mute", mute_command))
+        dp.add_handler(CommandHandler("unmute", unmute_command))
         
-        app.add_handler(CommandHandler("setstartvideo", set_start_video))
-        app.add_handler(CommandHandler("deletestartvideo", delete_start_video))
-        app.add_handler(CommandHandler("setwelcomevideo", set_welcome_video))
-        app.add_handler(CommandHandler("deletewelcomevideo", delete_welcome_video))
-        app.add_handler(CommandHandler("setleavevideo", set_leave_video))
-        app.add_handler(CommandHandler("deleteleavevideo", delete_leave_video))
+        dp.add_handler(CommandHandler("setstartvideo", set_start_video))
+        dp.add_handler(CommandHandler("deletestartvideo", delete_start_video))
+        dp.add_handler(CommandHandler("setwelcomevideo", set_welcome_video))
+        dp.add_handler(CommandHandler("deletewelcomevideo", delete_welcome_video))
+        dp.add_handler(CommandHandler("setleavevideo", set_leave_video))
+        dp.add_handler(CommandHandler("deleteleavevideo", delete_leave_video))
         
-        app.add_handler(CommandHandler("liststickers", list_stickers))
-        app.add_handler(CommandHandler("clearstickers", clear_stickers))
-        app.add_handler(CommandHandler("listphotos", list_photos))
-        app.add_handler(CommandHandler("clearphotos", clear_photos))
+        dp.add_handler(CommandHandler("liststickers", list_stickers))
+        dp.add_handler(CommandHandler("clearstickers", clear_stickers))
+        dp.add_handler(CommandHandler("listphotos", list_photos))
+        dp.add_handler(CommandHandler("clearphotos", clear_photos))
         
-        app.add_handler(CommandHandler("todaystats", today_stats))
-        app.add_handler(CommandHandler("weekstats", week_stats))
-        app.add_handler(CommandHandler("monthstats", month_stats))
-        app.add_handler(CommandHandler("allstats", all_stats))
-        app.add_handler(CommandHandler("storage", storage_status))
-        app.add_handler(CommandHandler("forceclean", force_clean))
+        dp.add_handler(CommandHandler("todaystats", today_stats))
+        dp.add_handler(CommandHandler("weekstats", week_stats))
+        dp.add_handler(CommandHandler("monthstats", month_stats))
+        dp.add_handler(CommandHandler("allstats", all_stats))
+        dp.add_handler(CommandHandler("storage", storage_status))
+        dp.add_handler(CommandHandler("forceclean", force_clean))
         
         # ===== Callbacks =====
-        app.add_handler(CallbackQueryHandler(help_callback, pattern="^help_"))
-        app.add_handler(CallbackQueryHandler(help_back, pattern="^help_back$"))
+        dp.add_handler(CallbackQueryHandler(help_callback, pattern="^help_"))
+        dp.add_handler(CallbackQueryHandler(help_back, pattern="^help_back$"))
         
         # ===== Handlers =====
-        app.add_handler(MessageHandler(
+        dp.add_handler(MessageHandler(
             filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER,
             handle_group_members
         ))
-        app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_messages))
+        dp.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_messages))
         
         # ===== Background Tasks =====
         asyncio.create_task(auto_clean_loop())
         
         # ===== Start =====
         logger.info("🤖 Bot started!")
-        await app.run_polling()
+        updater.start_polling()
         
     except Exception as e:
         logger.error(f"Main error: {e}")
