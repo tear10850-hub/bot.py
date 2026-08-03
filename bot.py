@@ -1245,8 +1245,6 @@ async def main():
         
         # ===== Start =====
         logger.info("🤖 Bot started!")
-        
-        # Webhook for Render
         await app.run_polling()
         
     except Exception as e:
